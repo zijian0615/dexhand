@@ -1,8 +1,31 @@
-import pybullet as p
 import numpy as np
 import os
 import time
-from avp_stream import VisionProStreamer
+
+try:
+    from hand_tracking_sdk.frame import HandFrame
+except ImportError:
+    HandFrame = None
+
+from quest_hand_pos import frame_matches_hand, quest_frame_to_hand_pos
+
+try:
+    from avp_stream import VisionProStreamer
+except ImportError:
+    VisionProStreamer = None
+
+
+def _import_pybullet():
+    try:
+        import pybullet as p
+    except ImportError as exc:
+        raise ImportError(
+            "PyBullet is required for IK simulation but is not installed. "
+            "On macOS it often fails to build from source. "
+            "For now, verify HTS with:\n"
+            "  uv run python Bidex_VisionPro_Teleop/quest_stream_test.py --port 8000"
+        ) from exc
+    return p
 
 '''
 This is based off of https://github.com/Improbable-AI/VisionProTeleop by Younghyo Park et. al. which streams the AVP data.
@@ -20,13 +43,20 @@ Inspired by Dexcap https://dex-cap.github.io/ by Wang et. al. and Robotic Teleki
 AVP_IP = "172.26.16.138"
 
 class Leapv1PybulletIKPython():
-    def __init__(self, is_left = True):
-        #start AVP         
-        self.vps = VisionProStreamer(ip = AVP_IP, record = True)
+    def __init__(self, is_left=True, use_avp=False, avp_ip=AVP_IP, gui=True):
+        p = _import_pybullet()
+        self.p = p
+        self.vps = None
+        if use_avp:
+            if VisionProStreamer is None:
+                raise ImportError(
+                    "Vision Pro teleop requires avp_stream. Install with: pip install avp_stream"
+                )
+            self.vps = VisionProStreamer(ip=avp_ip, record=True)
         # start pybullet
         #clid = p.connect(p.SHARED_MEMORY)
-        #clid = p.connect(p.DIRECT)
-        p.connect(p.GUI)
+        # Use DIRECT (headless) on a Jetson with no display, GUI otherwise.
+        p.connect(p.GUI if gui else p.DIRECT)
         # load right leap hand           
         path_src = os.path.abspath(__file__)
         path_src = os.path.dirname(path_src)
@@ -59,6 +89,7 @@ class Leapv1PybulletIKPython():
         self.create_target_vis()
             
     def create_target_vis(self):
+        p = self.p
         # load balls
         small_ball_radius = 0.01
         small_ball_shape = p.createCollisionShape(p.GEOM_SPHERE, radius=small_ball_radius)
@@ -79,6 +110,7 @@ class Leapv1PybulletIKPython():
         p.changeVisualShape(self.ballMbt[3], -1, rgbaColor=[1, 1, 1, 1])
         
     def update_target_vis(self, hand_pos):
+        p = self.p
         _, current_orientation = p.getBasePositionAndOrientation( self.ballMbt[0])
         p.resetBasePositionAndOrientation(self.ballMbt[0], hand_pos[3], current_orientation)
         _, current_orientation = p.getBasePositionAndOrientation(self.ballMbt[1])
@@ -102,8 +134,26 @@ class Leapv1PybulletIKPython():
         return output
     
 
+    def get_quest_data(self, frame):
+        """Convert one Quest HTS HandFrame into 16 LEAP joint angles."""
+        if HandFrame is None:
+            raise ImportError(
+                "Quest teleop requires hand-tracking-sdk. Install with: pip install hand-tracking-sdk"
+            )
+        if not isinstance(frame, HandFrame):
+            raise TypeError(f"Expected HandFrame, got {type(frame)!r}")
+        if not frame_matches_hand(frame, self.is_left):
+            return None
+
+        hand_pos = quest_frame_to_hand_pos(frame)
+        return self.get_glove_data(hand_pos)
+
     def get_avp_data(self):
         #gets the data converts it and then computes IK and visualizes
+        if self.vps is None:
+            raise RuntimeError(
+                "Vision Pro streamer is not initialized. Pass use_avp=True to __init__()."
+            )
         r = self.vps.latest              
         if self.is_left:
             hand_pose = np.asarray(r['left_fingers']).astype(float)  
@@ -120,6 +170,7 @@ class Leapv1PybulletIKPython():
         return output
         
     def compute_IK(self, hand_pos):
+        p = self.p
         p.stepSimulation()     
 
         rightHandIndex_middle_pos = hand_pos[2]
